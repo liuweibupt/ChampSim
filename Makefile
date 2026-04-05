@@ -115,7 +115,9 @@ configclean: clean compile_commands_clean
 reverse = $(if $(wordlist 2,2,$(1)),$(call reverse,$(call tail,$1)) $(firstword $(1)),$(1))
 
 absolute.options:
-	@echo "-I$(realpath inc) -isystem $(realpath $(TRIPLET_DIR)/include)" > $@
+	@printf '%s' "-I$(realpath inc)" > $@
+	@if [ -d "$(TRIPLET_DIR)/include" ]; then printf ' -isystem %s' "$(realpath $(TRIPLET_DIR)/include)" >> $@; fi
+	@printf '\n' >> $@
 
 attach_options = $(call reverse, $(addprefix @,$(filter %.options, $^)))
 
@@ -332,7 +334,15 @@ pytest:
 	PYTHONPATH=$(PYTHONPATH):$(ROOT_DIR) python3 -m unittest discover -v --start-directory='test/python'
 
 ifeq (,$(filter clean compile_commands compile_commands_clean configclean pytest maketest, $(MAKECMDGOALS)))
--include $(patsubst $(OBJ_ROOT)/%.o,$(DEP_ROOT)/%.d,$(foreach build_id,TEST $(build_ids),$(call get_base_objs,$(build_id))) $(test_base_objs) $(base_module_objs))
+include_test_deps := $(filter test $(test_main_name) maketest pytest,$(MAKECMDGOALS))
+dep_build_ids := $(build_ids)
+dep_test_base_objs :=
+ifneq (,$(include_test_deps))
+dep_build_ids := TEST $(build_ids)
+dep_test_base_objs := $(test_base_objs)
+endif
+
+-include $(patsubst $(OBJ_ROOT)/%.o,$(DEP_ROOT)/%.d,$(foreach build_id,$(dep_build_ids),$(call get_base_objs,$(build_id))) $(dep_test_base_objs) $(base_module_objs))
 endif
 
 ifeq (maketest,$(findstring maketest,$(MAKECMDGOALS)))
