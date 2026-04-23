@@ -16,14 +16,17 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cctype>
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -237,6 +240,41 @@ private:
   return value;
 }
 
+[[nodiscard]] auto parse_u64_string(std::string_view text) -> uint64_t
+{
+  if (text.empty()) {
+    throw std::invalid_argument{"Invalid unsigned integer string: ''"};
+  }
+
+  if (text.front() == '-') {
+    throw std::invalid_argument{fmt::format("Unsigned integer string '{}' must be non-negative", text)};
+  }
+
+  auto digits = text;
+  auto base = 10;
+  if (digits.size() >= 2 && digits[0] == "0"[0] && (digits[1] == "x"[0] || digits[1] == "X"[0])) {
+    digits.remove_prefix(2);
+    base = 16;
+  }
+
+  if (digits.empty()) {
+    throw std::invalid_argument{fmt::format("Invalid unsigned integer string: '{}'", text)};
+  }
+
+  uint64_t parsed{};
+  const auto* begin = digits.data();
+  const auto* end = digits.data() + digits.size();
+  const auto [ptr, ec] = std::from_chars(begin, end, parsed, base);
+  if (ec == std::errc::result_out_of_range) {
+    throw std::invalid_argument{fmt::format("Unsigned integer string '{}' is out of range for uint64", text)};
+  }
+  if (ec != std::errc{} || ptr != end) {
+    throw std::invalid_argument{fmt::format("Invalid unsigned integer string: '{}'", text)};
+  }
+
+  return parsed;
+}
+
 [[nodiscard]] auto parse_u64(const json& value) -> uint64_t
 {
   if (value.is_number_unsigned()) {
@@ -252,10 +290,21 @@ private:
   }
 
   if (value.is_string()) {
-    return std::stoull(value.get<std::string>(), nullptr, 0);
+    return parse_u64_string(value.get<std::string>());
   }
 
   throw std::invalid_argument{"Replay values must be integers or integer-like strings"};
+}
+
+[[nodiscard]] auto parse_u32(const json& value, std::string_view field_name) -> uint32_t
+{
+  constexpr auto max_u32 = std::numeric_limits<uint32_t>::max();
+  const auto parsed = parse_u64(value);
+  if (parsed > max_u32) {
+    throw std::invalid_argument{fmt::format("Field '{}' is out of range for uint32: {}", field_name, parsed)};
+  }
+
+  return static_cast<uint32_t>(parsed);
 }
 
 [[nodiscard]] auto parse_access_type(const json& value) -> access_type
@@ -319,13 +368,13 @@ void apply_cache_overrides(champsim::cache_builder<champsim::cache_builder_modul
   if (const auto it = cache.find("name"); it != cache.end())
     config.name = it->get<std::string>();
   if (const auto it = cache.find("sets"); it != cache.end())
-    config.sets = static_cast<uint32_t>(parse_u64(*it));
+    config.sets = parse_u32(*it, "sets");
   if (const auto it = cache.find("ways"); it != cache.end())
-    config.ways = static_cast<uint32_t>(parse_u64(*it));
+    config.ways = parse_u32(*it, "ways");
   if (const auto it = cache.find("pq_size"); it != cache.end())
-    config.pq_size = static_cast<uint32_t>(parse_u64(*it));
+    config.pq_size = parse_u32(*it, "pq_size");
   if (const auto it = cache.find("mshr_size"); it != cache.end())
-    config.mshr_size = static_cast<uint32_t>(parse_u64(*it));
+    config.mshr_size = parse_u32(*it, "mshr_size");
   if (const auto it = cache.find("hit_latency"); it != cache.end())
     config.hit_latency = parse_u64(*it);
   if (const auto it = cache.find("fill_latency"); it != cache.end())
@@ -361,7 +410,7 @@ void apply_cache_overrides(champsim::cache_builder<champsim::cache_builder_modul
     if (const auto it = entry.find("type"); it != entry.end())
       access.type = parse_access_type(*it);
     if (const auto it = entry.find("cpu"); it != entry.end())
-      access.cpu = static_cast<uint32_t>(parse_u64(*it));
+      access.cpu = parse_u32(*it, "cpu");
 
     accesses.push_back(access);
   }
@@ -482,25 +531,32 @@ int llmcompass_replay_main(int argc, char** argv)
   app.add_option("--input", input_path, "Replay JSON file to execute")->required()->check(CLI::ExistingFile);
   app.add_option("--output", output_path, "Optional JSON output path; stdout is used when omitted");
 
-  CLI11_PARSE(app, argc, argv);
+  try {
+    app.parse(argc, argv);
 
-  const auto document = read_json_file(input_path);
-  const auto config = parse_config(document);
-  const auto accesses = parse_accesses(document);
-  const auto report = to_json(run_replay(config, accesses));
+    const auto document = read_json_file(input_path);
+    const auto config = parse_config(document);
+    const auto accesses = parse_accesses(document);
+    const auto report = to_json(run_replay(config, accesses));
 
-  if (output_path.empty()) {
-    fmt::print("{}\n", report.dump(2));
+    if (output_path.empty()) {
+      fmt::print("{}\n", report.dump(2));
+      return 0;
+    }
+
+    std::ofstream output{output_path};
+    if (!output.is_open()) {
+      throw std::runtime_error{fmt::format("Unable to open replay output '{}'", output_path)};
+    }
+
+    output << report.dump(2) << '\n';
     return 0;
+  } catch (const CLI::ParseError& e) {
+    return app.exit(e);
+  } catch (const std::exception& e) {
+    fmt::print(stderr, "llmcompass_replay error: {}\n", e.what());
+    return 1;
   }
-
-  std::ofstream output{output_path};
-  if (!output.is_open()) {
-    throw std::runtime_error{fmt::format("Unable to open replay output '{}'", output_path)};
-  }
-
-  output << report.dump(2) << '\n';
-  return 0;
 }
 
 #ifdef CHAMPSIM_LLMCOMPASS_REPLAY_MAIN
