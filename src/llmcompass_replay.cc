@@ -39,6 +39,7 @@
 #include "channel.h"
 #include "defaults.hpp"
 #include "operable.h"
+#include "../replacement/srrip/srrip.h"
 #include "util/to_underlying.h"
 
 #ifdef CHAMPSIM_LLMCOMPASS_REPLAY_MAIN
@@ -60,6 +61,8 @@ struct ReplayAccess {
 };
 
 struct ReplayConfig {
+  enum class replacement_policy_kind { lru, srrip };
+
   std::optional<std::string> name;
   std::optional<uint32_t> sets;
   std::optional<uint32_t> ways;
@@ -68,6 +71,7 @@ struct ReplayConfig {
   std::optional<uint64_t> hit_latency;
   std::optional<uint64_t> fill_latency;
   uint64_t memory_latency{1};
+  replacement_policy_kind replacement_policy{replacement_policy_kind::lru};
 };
 
 struct ReplayObservation {
@@ -335,8 +339,8 @@ private:
   return json::parse(stream);
 }
 
-void apply_cache_overrides(champsim::cache_builder<champsim::cache_builder_module_type_holder<no>, champsim::cache_builder_module_type_holder<lru>>& builder,
-                           ReplayConfig config, champsim::channel* upper_level, champsim::channel* lower_level)
+template <typename Builder>
+void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::channel* upper_level, champsim::channel* lower_level)
 {
   builder.upper_levels({upper_level}).lower_level(lower_level);
 
@@ -354,6 +358,16 @@ void apply_cache_overrides(champsim::cache_builder<champsim::cache_builder_modul
     builder.hit_latency(*config.hit_latency);
   if (config.fill_latency.has_value())
     builder.fill_latency(*config.fill_latency);
+}
+
+[[nodiscard]] auto parse_replacement_policy(std::string_view value) -> ReplayConfig::replacement_policy_kind
+{
+  const auto normalized = upper_case(std::string{value});
+  if (normalized == "LRU")
+    return ReplayConfig::replacement_policy_kind::lru;
+  if (normalized == "SRRIP")
+    return ReplayConfig::replacement_policy_kind::srrip;
+  throw std::invalid_argument{fmt::format("Unsupported replay replacement policy '{}'", value)};
 }
 
 [[nodiscard]] auto parse_config(const json& document) -> ReplayConfig
@@ -381,6 +395,8 @@ void apply_cache_overrides(champsim::cache_builder<champsim::cache_builder_modul
     config.fill_latency = parse_u64(*it);
   if (const auto it = cache.find("memory_latency"); it != cache.end())
     config.memory_latency = parse_u64(*it);
+  if (const auto it = cache.find("replacement_policy"); it != cache.end())
+    config.replacement_policy = parse_replacement_policy(it->get<std::string>());
 
   return config;
 }
@@ -463,12 +479,12 @@ void record_address_observation(std::map<std::string, AddressSummary>& address_s
   throw std::runtime_error{fmt::format("Replay access {} did not update cache hit/miss counters", format_address(access.address))};
 }
 
-[[nodiscard]] auto run_replay(const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+template <typename Builder>
+[[nodiscard]] auto run_replay_with_builder(Builder builder, const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
 {
   ReplayProducer producer{};
   FixedLatencyMemory memory{config.memory_latency};
 
-  auto builder = champsim::defaults::default_llc;
   apply_cache_overrides(builder, config, &producer.queues, &memory.queues);
   CACHE cache{builder};
 
@@ -492,6 +508,17 @@ void record_address_observation(std::map<std::string, AddressSummary>& address_s
   }
 
   return report;
+}
+
+[[nodiscard]] auto run_replay(const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+{
+  if (config.replacement_policy == ReplayConfig::replacement_policy_kind::srrip) {
+    auto builder = champsim::cache_builder{champsim::defaults::default_llc}.replacement<srrip>();
+    return run_replay_with_builder(builder, config, accesses);
+  }
+
+  auto builder = champsim::defaults::default_llc;
+  return run_replay_with_builder(builder, config, accesses);
 }
 
 [[nodiscard]] auto to_json(const ReplayReport& report) -> json

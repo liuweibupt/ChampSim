@@ -118,6 +118,31 @@ TEST_CASE("The replay driver writes JSON to --output when requested")
   REQUIRE(output["summary"]["misses"] == 1);
 }
 
+TEST_CASE("The replay driver accepts replacement_policy and differentiates policy-sensitive traces")
+{
+  const auto accesses = nlohmann::json::array(
+      {nlohmann::json{{"address", "0x0"}}, nlohmann::json{{"address", "0x0"}}, nlohmann::json{{"address", "0x40"}},
+       nlohmann::json{{"address", "0x80"}}, nlohmann::json{{"address", "0x0"}}});
+  const auto base_cache =
+      nlohmann::json{{"name", "policy-llc"}, {"sets", 1}, {"ways", 2}, {"hit_latency", 2}, {"fill_latency", 1}, {"memory_latency", 10}};
+
+  auto lru_replay = nlohmann::json{{"cache", base_cache}, {"accesses", accesses}};
+  auto srrip_replay = nlohmann::json{{"cache", base_cache}, {"accesses", accesses}};
+  srrip_replay["cache"]["replacement_policy"] = "srrip";
+
+  const auto lru_result = run_driver(lru_replay, false);
+  const auto srrip_result = run_driver(srrip_replay, false);
+
+  REQUIRE(lru_result.exit_code == 0);
+  REQUIRE(srrip_result.exit_code == 0);
+
+  const auto lru_output = nlohmann::json::parse(lru_result.stdout_text);
+  const auto srrip_output = nlohmann::json::parse(srrip_result.stdout_text);
+  REQUIRE(lru_output["summary"]["hits"] == 1);
+  REQUIRE(srrip_output["summary"]["hits"] == 2);
+  REQUIRE(srrip_output["summary"]["total_latency_cycles"] < lru_output["summary"]["total_latency_cycles"]);
+}
+
 TEST_CASE("The replay driver rejects malformed integer strings")
 {
   const auto replay = nlohmann::json{{"accesses", nlohmann::json::array({nlohmann::json{{"address", "123garbage"}}})}};

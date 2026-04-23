@@ -34,6 +34,7 @@
 - `hit_latency`: 可选，命中延迟（cycles）
 - `fill_latency`: 可选，fill 延迟（cycles）
 - `memory_latency`: 可选，下层固定内存延迟（cycles）
+- `replacement_policy`: 可选，当前支持 `lru`（默认）和 `srrip`
 
 未提供的 cache 参数会回退到 `champsim::defaults::default_llc`。
 
