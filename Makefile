@@ -287,6 +287,22 @@ $(DEP_ROOT)/modules/%/: | $(DEP_ROOT)/modules/
 	mkdir -p $@
 endif
 
+llmcompass_replay_name=$(BIN_ROOT)/llmcompass_replay
+llmcompass_replay_obj=$(OBJ_ROOT)/llmcompass_replay_entry.o
+llmcompass_replay_dep=$(DEP_ROOT)/llmcompass_replay_entry.d
+llmcompass_replay_base_objs=$(filter-out $(OBJ_ROOT)/LLMCOMPASS_main.o $(OBJ_ROOT)/llmcompass_replay.o,$(call get_object_list,$(base_source_dir),$(OBJ_ROOT),LLMCOMPASS))
+
+$(llmcompass_replay_obj): override CPPFLAGS += -DCHAMPSIM_LLMCOMPASS_REPLAY_MAIN
+$(llmcompass_replay_dep): override CPPFLAGS += -DCHAMPSIM_LLMCOMPASS_REPLAY_MAIN
+
+$(llmcompass_replay_obj): src/llmcompass_replay.cc $(base_options) | $(llmcompass_replay_dep) $$(dir $$@)
+	$(obj_recipe)
+$(llmcompass_replay_dep): src/llmcompass_replay.cc $(base_options) | $(generated_files) $$(dir $$@)
+	$(dep_recipe)
+
+$(llmcompass_replay_name): $(llmcompass_replay_base_objs) $(llmcompass_replay_obj) $(base_module_objs) $(nonbase_module_objs) | $$(dir $$@)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LOADLIBES) $(LDLIBS)
+
 # Give the test executable some additional options
 $(test_main_name): override CPPFLAGS += -DCHAMPSIM_TEST_BUILD
 $(test_main_name): override CXXFLAGS += -g3 -Og
@@ -327,7 +343,7 @@ compile_commands: $(src_compile_commands_file) $(inc_compile_commands_file) $(te
 ifdef TEST_NUM
 selected_test = -\# "[$(addprefix \#,$(filter $(addsuffix %,$(TEST_NUM)), $(patsubst %.cc,%,$(notdir $(wildcard $(test_source_dir)/*.cc)))))]"
 endif
-test: $(test_main_name)
+test: $(test_main_name) $(llmcompass_replay_name)
 	$(test_main_name) $(selected_test)
 
 pytest:
@@ -342,7 +358,7 @@ dep_build_ids := TEST $(build_ids)
 dep_test_base_objs := $(test_base_objs)
 endif
 
--include $(patsubst $(OBJ_ROOT)/%.o,$(DEP_ROOT)/%.d,$(foreach build_id,$(dep_build_ids),$(call get_base_objs,$(build_id))) $(dep_test_base_objs) $(base_module_objs))
+-include $(patsubst $(OBJ_ROOT)/%.o,$(DEP_ROOT)/%.d,$(foreach build_id,$(dep_build_ids),$(call get_base_objs,$(build_id))) $(dep_test_base_objs) $(base_module_objs)) $(llmcompass_replay_dep)
 endif
 
 ifeq (maketest,$(findstring maketest,$(MAKECMDGOALS)))
