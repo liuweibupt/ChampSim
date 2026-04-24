@@ -70,6 +70,35 @@ DriverResult run_driver(const nlohmann::json& input, bool use_output_flag)
 
   return DriverResult{exit_code, stdout_text, stderr_text, output_text};
 }
+
+DriverResult run_bridge_driver(const nlohmann::json& trace, const nlohmann::json& cache, uint64_t clock_frequency_hz)
+{
+  const auto trace_path = make_temp_file("llmcompass-bridge-trace");
+  const auto stdout_path = make_temp_file("llmcompass-bridge-stdout");
+  const auto stderr_path = make_temp_file("llmcompass-bridge-stderr");
+
+  write_json(trace_path, trace);
+
+  auto command = std::string{"./bin/llmcompass_replay --trace '"} + trace_path + "'"
+                 + " --cache-name bridge-llc"
+                 + " --l3-size-byte 256"
+                 + " --l3-associativity 2"
+                 + " --l3-line-size-byte 64"
+                 + " --output-format json"
+                 + " --bridge-cache-json '" + cache.dump() + "'"
+                 + " --bridge-clock-frequency-hz " + std::to_string(clock_frequency_hz)
+                 + " > '" + stdout_path + "' 2> '" + stderr_path + "'";
+
+  const auto exit_code = std::system(command.c_str());
+  const auto stdout_text = read_file(stdout_path);
+  const auto stderr_text = read_file(stderr_path);
+
+  std::remove(trace_path.c_str());
+  std::remove(stdout_path.c_str());
+  std::remove(stderr_path.c_str());
+
+  return DriverResult{exit_code, stdout_text, stderr_text, {}};
+}
 } // namespace
 
 TEST_CASE("An ordered LLC replay reports hits, misses, and total latency")
@@ -141,6 +170,31 @@ TEST_CASE("The replay driver accepts replacement_policy and differentiates polic
   REQUIRE(lru_output["summary"]["hits"] == 1);
   REQUIRE(srrip_output["summary"]["hits"] == 2);
   REQUIRE(srrip_output["summary"]["total_latency_cycles"] < lru_output["summary"]["total_latency_cycles"]);
+}
+
+TEST_CASE("The replay driver accepts native LLMCompass bridge flags and expands sized trace entries")
+{
+  const auto trace = nlohmann::json::array({
+      nlohmann::json{{"order", 0}, {"phase", "decode"}, {"op_id", "decode:0:qkv"}, {"tensor_role", "weights"},
+                     {"stream_id", "wq"}, {"address", 0}, {"size", 128}, {"access_type", "read"}},
+      nlohmann::json{{"order", 1}, {"phase", "decode"}, {"op_id", "decode:1:qkv"}, {"tensor_role", "weights"},
+                     {"stream_id", "wq"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
+  });
+  const auto cache = nlohmann::json{{"hit_latency_cycles", 2}, {"fill_latency_cycles", 1}, {"memory_latency_cycles", 5},
+                                    {"replacement_policy", "lru"}};
+
+  const auto result = run_bridge_driver(trace, cache, 1000000000);
+
+  REQUIRE(result.exit_code == 0);
+  REQUIRE(result.stderr_text.empty());
+  const auto output = nlohmann::json::parse(result.stdout_text);
+  REQUIRE(output["hit_count"] == 1);
+  REQUIRE(output["miss_count"] == 2);
+  REQUIRE(output["hit_rate"] == Catch::Approx(1.0 / 3.0));
+  REQUIRE(output["total_memory_time_sec"] == Catch::Approx(23e-9));
+  REQUIRE(output["phase_stats"]["decode"]["accesses"] == 3);
+  REQUIRE(output["phase_stats"]["decode"]["hits"] == 1);
+  REQUIRE(output["phase_stats"]["decode"]["misses"] == 2);
 }
 
 TEST_CASE("The replay driver rejects malformed integer strings")
