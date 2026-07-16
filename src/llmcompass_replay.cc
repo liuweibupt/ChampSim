@@ -62,7 +62,7 @@ struct ReplayAccess {
 };
 
 struct ReplayConfig {
-  enum class replacement_policy_kind { lru, srrip };
+  enum class replacement_policy_kind { lru, srrip, bypass };
 
   std::optional<std::string> name;
   std::optional<uint32_t> sets;
@@ -391,6 +391,8 @@ void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::chan
     return ReplayConfig::replacement_policy_kind::lru;
   if (normalized == "SRRIP")
     return ReplayConfig::replacement_policy_kind::srrip;
+  if (normalized == "BYPASS" || normalized == "NO_ALLOCATE" || normalized == "STREAMING_NO_ALLOCATE_BYPASS")
+    return ReplayConfig::replacement_policy_kind::bypass;
   throw std::invalid_argument{fmt::format("Unsupported replay replacement policy '{}'", value)};
 }
 
@@ -626,6 +628,25 @@ template <typename Builder>
 
 [[nodiscard]] auto run_replay(const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
 {
+  if (config.replacement_policy == ReplayConfig::replacement_policy_kind::bypass) {
+    ReplayReport report{};
+    report.accesses.reserve(accesses.size());
+    for (const auto& access : accesses) {
+      auto observation = ReplayObservation{format_address(access.address),
+                                           "miss",
+                                           std::string{access_type_names.at(champsim::to_underlying(access.type))},
+                                           access.cpu,
+                                           config.memory_latency,
+                                           access.phase};
+      ++report.misses;
+      report.total_latency_cycles += observation.latency_cycles;
+      record_address_observation(report.addresses, observation);
+      record_phase_observation(report.phases, observation);
+      report.accesses.push_back(std::move(observation));
+    }
+    return report;
+  }
+
   if (config.replacement_policy == ReplayConfig::replacement_policy_kind::srrip) {
     auto builder = champsim::cache_builder{champsim::defaults::default_llc}.replacement<srrip>();
     return run_replay_with_builder(builder, config, accesses);

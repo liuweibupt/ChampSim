@@ -39,7 +39,7 @@
 - `hit_latency`: 可选，命中延迟（cycles）
 - `fill_latency`: 可选，fill 延迟（cycles）
 - `memory_latency`: 可选，下层固定内存延迟（cycles）
-- `replacement_policy`: 可选，当前支持 `lru`（默认）和 `srrip`
+- `replacement_policy`: 可选，当前支持 `lru`（默认）、`srrip` 和 `bypass`/`no_allocate`
 
 未提供的 cache 参数会回退到 `champsim::defaults::default_llc`。
 
@@ -86,6 +86,9 @@ bridge 输出字段为 LLMCompass 直接消费的 JSON：
 - `hit_rate`
 - `eviction_count`
 - `phase_stats`
+
+`bypass`/`no_allocate` 是显式的 streaming no-allocate 模式：每个访问都按 miss 计入并直接使用
+`memory_latency_cycles`，不会静默退化成 LRU。
 
 ## 构建
 

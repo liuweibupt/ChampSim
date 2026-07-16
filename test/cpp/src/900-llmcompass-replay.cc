@@ -197,6 +197,26 @@ TEST_CASE("The replay driver accepts native LLMCompass bridge flags and expands 
   REQUIRE(output["phase_stats"]["decode"]["misses"] == 2);
 }
 
+TEST_CASE("The bridge replay driver supports explicit bypass no-allocate policy")
+{
+  const auto trace = nlohmann::json::array({
+      nlohmann::json{{"phase", "decode"}, {"address", 0}, {"size", 128}, {"access_type", "read"}},
+      nlohmann::json{{"phase", "decode"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
+  });
+  const auto cache = nlohmann::json{{"memory_latency_cycles", 5}, {"replacement_policy", "bypass"}};
+
+  const auto result = run_bridge_driver(trace, cache, 1000000000);
+
+  REQUIRE(result.exit_code == 0);
+  REQUIRE(result.stderr_text.empty());
+  const auto output = nlohmann::json::parse(result.stdout_text);
+  REQUIRE(output["hit_count"] == 0);
+  REQUIRE(output["miss_count"] == 3);
+  REQUIRE(output["total_memory_time_sec"] == Catch::Approx(15e-9));
+  REQUIRE(output["phase_stats"]["decode"]["hits"] == 0);
+  REQUIRE(output["phase_stats"]["decode"]["misses"] == 3);
+}
+
 TEST_CASE("The replay driver rejects malformed integer strings")
 {
   const auto replay = nlohmann::json{{"accesses", nlohmann::json::array({nlohmann::json{{"address", "123garbage"}}})}};
