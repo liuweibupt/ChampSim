@@ -18,6 +18,7 @@
 #include <array>
 #include <charconv>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <deque>
 #include <fstream>
@@ -97,6 +98,22 @@ struct ReplayReport {
   std::map<std::string, AddressSummary> addresses{};
   std::map<std::string, AddressSummary> phases{};
 };
+
+struct NativePolicyInput {
+  std::string config_path;
+  std::string trace_path;
+  std::string cache_name;
+  uint64_t l3_size_byte{0};
+  uint64_t l3_associativity{0};
+  uint64_t l3_line_size_byte{0};
+  uint64_t sram_mib{0};
+  std::string policy;
+};
+
+constexpr uint64_t NATIVE_POLICY_CLOCK_HZ = 1000000000;
+constexpr std::string_view DEMAND_PHASE_SUFFIX = "/demand";
+constexpr std::string_view PREFETCH_PHASE_SUFFIX = "/prefetch";
+constexpr std::string_view NATIVE_POLICY_NOTE = "policy-capable ChampSim LLC ordered replay native_result";
 
 class ReplayProducer final : public champsim::operable
 {
@@ -427,6 +444,73 @@ void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::chan
   return config;
 }
 
+[[nodiscard]] auto ends_with(std::string_view value, std::string_view suffix) -> bool
+{
+  return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
+}
+
+[[nodiscard]] auto sibling_path(const std::string& path, const std::string& filename) -> std::string
+{
+  const auto pos = path.find_last_of("/\\");
+  if (pos == std::string::npos) {
+    return filename;
+  }
+  return path.substr(0, pos + 1) + filename;
+}
+
+[[nodiscard]] auto replacement_policy_for_implementation(std::string_view implementation) -> std::string
+{
+  const auto normalized = upper_case(std::string{implementation});
+  if (normalized == "TRANSPARENT_LRU_ALLOCATE_ON_MISS" || normalized == "DESCRIPTOR_MANAGED_PIN_WINDOW" ||
+      normalized == "LOOKAHEAD_PREFETCH_NO_PERSISTENCE") {
+    return "lru";
+  }
+  if (normalized == "STREAMING_NO_ALLOCATE_BYPASS") {
+    return "bypass";
+  }
+  if (normalized.find("SRRIP") != std::string::npos) {
+    return "srrip";
+  }
+  throw std::invalid_argument{fmt::format("Unsupported 3D-SRAM policy implementation '{}'", implementation)};
+}
+
+[[nodiscard]] auto cache_json_from_3dsram_config(const json& document) -> json
+{
+  const auto& timing = document.at("timing");
+  return json{{"hit_latency_cycles", parse_u64(timing.at("hit_latency_cycles"))},
+              {"fill_latency_cycles", parse_u64(timing.at("fill_latency_cycles"))},
+              {"memory_latency_cycles", parse_u64(timing.at("hbm_fallback_latency_cycles"))},
+              {"replacement_policy", replacement_policy_for_implementation(document.at("policy_implementation").get<std::string>())}};
+}
+
+void validate_policy_input(const NativePolicyInput& input, const json& config)
+{
+  const auto& capacity = config.at("capacity");
+  std::map<std::string, std::pair<std::string, std::string>> checks{
+      {"policy", {config.at("policy").get<std::string>(), input.policy}},
+      {"sram_mib", {std::to_string(parse_u64(capacity.at("sram_mib"))), std::to_string(input.sram_mib)}},
+      {"capacity_bytes", {std::to_string(parse_u64(capacity.at("capacity_bytes"))), std::to_string(input.l3_size_byte)}},
+      {"associativity", {std::to_string(parse_u64(capacity.at("associativity"))), std::to_string(input.l3_associativity)}},
+      {"line_bytes", {std::to_string(parse_u64(capacity.at("line_bytes"))), std::to_string(input.l3_line_size_byte)}}};
+
+  std::vector<std::string> mismatches{};
+  for (const auto& [field, values] : checks) {
+    if (values.first != values.second) {
+      mismatches.push_back(fmt::format("{} expected {} got {}", field, values.first, values.second));
+    }
+  }
+  if (!mismatches.empty()) {
+    std::string detail = mismatches.front();
+    for (std::size_t i = 1; i < mismatches.size(); ++i) {
+      detail += "; " + mismatches[i];
+    }
+    throw std::invalid_argument{fmt::format("3D-SRAM policy CLI/config mismatch: {}", detail)};
+  }
+  if (input.cache_name.empty()) {
+    throw std::invalid_argument{"--cache-name is required for 3D-SRAM policy mode"};
+  }
+}
+
 [[nodiscard]] auto parse_accesses(const json& document) -> std::vector<ReplayAccess>
 {
   const auto accesses_it = document.find("accesses");
@@ -748,6 +832,15 @@ void write_report(const json& report, const std::string& output_path)
   return parsed;
 }
 
+[[nodiscard]] auto run_bridge_report(const std::string& trace_path, const std::string& cache_name, const json& cache_json,
+                                     uint64_t l3_size_byte, uint64_t l3_associativity, uint64_t l3_line_size_byte) -> ReplayReport
+{
+  const auto config = bridge_cache_config(cache_json, cache_name, l3_size_byte, l3_associativity, l3_line_size_byte);
+  const auto trace = read_json_file(trace_path);
+  const auto accesses = parse_bridge_accesses(trace, l3_line_size_byte);
+  return run_replay(config, accesses);
+}
+
 [[nodiscard]] auto run_bridge_input(const std::string& trace_path, const std::string& cache_name, const std::string& bridge_cache_json,
                                     uint64_t l3_size_byte, uint64_t l3_associativity, uint64_t l3_line_size_byte,
                                     uint64_t clock_frequency_hz, const std::string& output_format) -> json
@@ -756,10 +849,79 @@ void write_report(const json& report, const std::string& output_path)
     throw std::invalid_argument{"Only --output-format json is supported"};
   }
   const auto cache_json = parse_bridge_cache_json(bridge_cache_json);
-  const auto config = bridge_cache_config(cache_json, cache_name, l3_size_byte, l3_associativity, l3_line_size_byte);
-  const auto trace = read_json_file(trace_path);
-  const auto accesses = parse_bridge_accesses(trace, l3_line_size_byte);
-  return to_bridge_json(run_replay(config, accesses), clock_frequency_hz);
+  return to_bridge_json(run_bridge_report(trace_path, cache_name, cache_json, l3_size_byte, l3_associativity, l3_line_size_byte), clock_frequency_hz);
+}
+
+[[nodiscard]] auto phase_count(const ReplayReport& report, std::string_view suffix, bool hits) -> uint64_t
+{
+  uint64_t total = 0;
+  for (const auto& [phase, summary] : report.phases) {
+    if (ends_with(phase, suffix)) {
+      total += hits ? summary.hits : summary.misses;
+    }
+  }
+  return total;
+}
+
+[[nodiscard]] auto simulator_commit() -> std::string
+{
+  for (const auto* command : {"git -C submodules/ChampSim rev-parse --short=12 HEAD 2>/dev/null", "git -C . rev-parse --short=12 HEAD 2>/dev/null"}) {
+    std::array<char, 64> buffer{};
+    std::string output{};
+    auto* pipe = popen(command, "r");
+    if (pipe == nullptr) {
+      continue;
+    }
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr) {
+      output += buffer.data();
+    }
+    const auto rc = pclose(pipe);
+    output.erase(std::remove_if(output.begin(), output.end(), [](unsigned char c) { return std::isspace(c); }), output.end());
+    if (rc == 0 && !output.empty()) {
+      return output;
+    }
+  }
+  throw std::runtime_error{"Unable to resolve ChampSim git commit for native_result"};
+}
+
+[[nodiscard]] auto native_result_json(const NativePolicyInput& input, const ReplayReport& report, const json& bridge_config, const json& trace_config) -> json
+{
+  const auto demand_hits = phase_count(report, DEMAND_PHASE_SUFFIX, true);
+  const auto demand_misses = phase_count(report, DEMAND_PHASE_SUFFIX, false);
+  const auto prefetch_misses = phase_count(report, PREFETCH_PHASE_SUFFIX, false);
+  if (report.total_latency_cycles == 0) {
+    throw std::runtime_error{"3D-SRAM policy replay produced zero token cycles"};
+  }
+  const auto measured_tokens = parse_u64(trace_config.at("tokens"));
+  const auto seconds = static_cast<double>(report.total_latency_cycles) / static_cast<double>(NATIVE_POLICY_CLOCK_HZ);
+  const auto line_bytes = input.l3_line_size_byte;
+  const auto stats = json{{"demand_accesses", parse_u64(bridge_config.at("demand_rows"))},
+                          {"demand_hits", demand_hits},
+                          {"residency_saved_hits", input.policy == "managed_pinned" ? demand_hits : uint64_t{0}},
+                          {"external_read_bytes", demand_misses * line_bytes},
+                          {"prefetch_read_bytes", prefetch_misses * line_bytes},
+                          {"sram_read_bytes", report.hits * line_bytes},
+                          {"sram_write_bytes", report.misses * line_bytes},
+                          {"bank_conflict_cycles", 0},
+                          {"controller_stall_cycles", 0},
+                          {"token_cycles", report.total_latency_cycles},
+                          {"token_ms", fmt::format("{:.6f}", seconds * 1000.0)},
+                          {"tok_s", fmt::format("{:.6f}", static_cast<double>(measured_tokens) / seconds)},
+                          {"simulator_commit", simulator_commit()},
+                          {"status", "ok"},
+                          {"notes", std::string{NATIVE_POLICY_NOTE}}};
+  return json{{"native_result", stats}};
+}
+
+[[nodiscard]] auto run_policy_input(const NativePolicyInput& input) -> json
+{
+  const auto config = read_json_file(input.config_path);
+  validate_policy_input(input, config);
+  const auto bridge_config = read_json_file(sibling_path(input.trace_path, "bridge_trace_config.json"));
+  const auto trace_config = read_json_file(sibling_path(input.trace_path, "trace_config.json"));
+  const auto report = run_bridge_report(input.trace_path, input.cache_name, cache_json_from_3dsram_config(config),
+                                        input.l3_size_byte, input.l3_associativity, input.l3_line_size_byte);
+  return native_result_json(input, report, bridge_config, trace_config);
 }
 } // namespace
 
@@ -769,22 +931,29 @@ int llmcompass_replay_main(int argc, char** argv)
 
   std::string input_path;
   std::string output_path;
+  std::string config_path;
   std::string trace_path;
   std::string cache_name;
   std::string output_format{"json"};
   std::string bridge_cache_json;
+  std::string policy;
   uint64_t l3_size_byte{0};
   uint64_t l3_associativity{0};
   uint64_t l3_line_size_byte{0};
+  uint64_t sram_mib{0};
   uint64_t bridge_clock_frequency_hz{1000000000};
 
+  app.footer("3D-SRAM policy mode emits native_result fields: external_read_bytes demand_hits residency_saved_hits prefetch_read_bytes bank_conflict_cycles controller_stall_cycles token_cycles");
   app.add_option("--input", input_path, "Legacy replay JSON file to execute")->check(CLI::ExistingFile);
+  app.add_option("--config", config_path, "3D-SRAM config JSON for native_result policy mode")->check(CLI::ExistingFile);
   app.add_option("--trace", trace_path, "LLMCompass bridge replay trace JSON")->check(CLI::ExistingFile);
   app.add_option("--output", output_path, "Optional JSON output path; stdout is used when omitted");
   app.add_option("--cache-name", cache_name, "LLMCompass bridge cache name");
   app.add_option("--l3-size-byte", l3_size_byte, "LLMCompass bridge L3 size in bytes");
   app.add_option("--l3-associativity", l3_associativity, "LLMCompass bridge L3 associativity");
   app.add_option("--l3-line-size-byte", l3_line_size_byte, "LLMCompass bridge line size in bytes");
+  app.add_option("--sram_mib", sram_mib, "3D-SRAM capacity in MiB for native_result policy mode");
+  app.add_option("--policy", policy, "3D-SRAM residency policy for native_result policy mode");
   app.add_option("--output-format", output_format, "LLMCompass bridge output format");
   app.add_option("--bridge-cache-json", bridge_cache_json, "Optional LLMCompass bridge cache timing JSON");
   app.add_option("--bridge-clock-frequency-hz", bridge_clock_frequency_hz, "Clock frequency used to convert replay cycles to seconds");
@@ -800,6 +969,15 @@ int llmcompass_replay_main(int argc, char** argv)
       return 0;
     }
     if (!trace_path.empty()) {
+      if (!config_path.empty() || !policy.empty() || sram_mib != 0) {
+        if (config_path.empty() || policy.empty() || sram_mib == 0) {
+          throw std::invalid_argument{"3D-SRAM policy mode requires --config, --policy, and positive --sram_mib"};
+        }
+        write_report(
+            run_policy_input(NativePolicyInput{config_path, trace_path, cache_name, l3_size_byte, l3_associativity, l3_line_size_byte, sram_mib, policy}),
+            output_path);
+        return 0;
+      }
       write_report(
           run_bridge_input(trace_path, cache_name, bridge_cache_json, l3_size_byte, l3_associativity, l3_line_size_byte,
                            bridge_clock_frequency_hz, output_format),

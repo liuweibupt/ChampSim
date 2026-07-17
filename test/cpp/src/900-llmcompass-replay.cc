@@ -30,6 +30,17 @@ std::string make_temp_file(const std::string& name)
   return {path_template.data()};
 }
 
+std::string make_temp_dir(const std::string& name)
+{
+  std::array<char, 64> path_template{};
+  const auto templ = "/tmp/" + name + ".XXXXXX";
+  std::copy(templ.begin(), templ.end(), path_template.begin());
+
+  const auto* path = mkdtemp(path_template.data());
+  REQUIRE(path != nullptr);
+  return {path};
+}
+
 std::string read_file(const std::string& path)
 {
   std::ifstream stream{path};
@@ -98,6 +109,49 @@ DriverResult run_bridge_driver(const nlohmann::json& trace, const nlohmann::json
   std::remove(stderr_path.c_str());
 
   return DriverResult{exit_code, stdout_text, stderr_text, {}};
+}
+
+DriverResult run_policy_driver(const nlohmann::json& trace, const nlohmann::json& config, const std::string& policy)
+{
+  const auto temp_dir = make_temp_dir("llmcompass-policy");
+  const auto trace_path = temp_dir + "/bridge_trace.json";
+  const auto config_path = temp_dir + "/sram_config.json";
+  const auto output_path = temp_dir + "/champsim_stats.json";
+  const auto stdout_path = make_temp_file("llmcompass-policy-stdout");
+  const auto stderr_path = make_temp_file("llmcompass-policy-stderr");
+
+  write_json(trace_path, trace);
+  write_json(config_path, config);
+  write_json(temp_dir + "/bridge_trace_config.json",
+             nlohmann::json{{"rows", 2}, {"demand_rows", 2}, {"prefetch_rows", 0}, {"trace_payload_sha256", "abc"}});
+  write_json(temp_dir + "/trace_config.json", nlohmann::json{{"tokens", 2}, {"warmup_tokens", 0}, {"trace_payload_sha256", "abc"}});
+
+  auto command = std::string{"./bin/llmcompass_replay --config '"} + config_path + "'"
+                 + " --trace '" + trace_path + "'"
+                 + " --cache-name 3d_weight_sram"
+                 + " --l3-size-byte 256"
+                 + " --l3-associativity 2"
+                 + " --l3-line-size-byte 64"
+                 + " --sram_mib 1"
+                 + " --policy " + policy
+                 + " --output '" + output_path + "'"
+                 + " > '" + stdout_path + "' 2> '" + stderr_path + "'";
+
+  const auto exit_code = std::system(command.c_str());
+  const auto stdout_text = read_file(stdout_path);
+  const auto stderr_text = read_file(stderr_path);
+  const auto output_text = exit_code == 0 ? read_file(output_path) : std::string{};
+
+  std::remove(trace_path.c_str());
+  std::remove(config_path.c_str());
+  std::remove((temp_dir + "/bridge_trace_config.json").c_str());
+  std::remove((temp_dir + "/trace_config.json").c_str());
+  std::remove(output_path.c_str());
+  std::remove(stdout_path.c_str());
+  std::remove(stderr_path.c_str());
+  rmdir(temp_dir.c_str());
+
+  return DriverResult{exit_code, stdout_text, stderr_text, output_text};
 }
 } // namespace
 
@@ -215,6 +269,34 @@ TEST_CASE("The bridge replay driver supports explicit bypass no-allocate policy"
   REQUIRE(output["total_memory_time_sec"] == Catch::Approx(15e-9));
   REQUIRE(output["phase_stats"]["decode"]["hits"] == 0);
   REQUIRE(output["phase_stats"]["decode"]["misses"] == 3);
+}
+
+TEST_CASE("The policy replay driver emits native_result counters for G3 production commands")
+{
+  const auto trace = nlohmann::json::array({
+      nlohmann::json{{"phase", "token_0/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
+      nlohmann::json{{"phase", "token_1/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
+  });
+  const auto config = nlohmann::json{{"policy", "managed_pinned"},
+                                     {"policy_implementation", "descriptor_managed_pin_window"},
+                                     {"capacity", {{"sram_mib", 1}, {"capacity_bytes", 256}, {"line_bytes", 64}, {"associativity", 2}}},
+                                     {"timing", {{"hit_latency_cycles", 2}, {"fill_latency_cycles", 1}, {"hbm_fallback_latency_cycles", 5}}}};
+
+  const auto result = run_policy_driver(trace, config, "managed_pinned");
+
+  REQUIRE(result.exit_code == 0);
+  REQUIRE(result.stdout_text.empty());
+  REQUIRE(result.stderr_text.empty());
+  const auto output = nlohmann::json::parse(result.output_text);
+  REQUIRE(output.contains("native_result"));
+  REQUIRE(output["native_result"]["status"] == "ok");
+  REQUIRE(output["native_result"]["demand_accesses"] == 2);
+  REQUIRE(output["native_result"]["demand_hits"] == 1);
+  REQUIRE(output["native_result"]["residency_saved_hits"] == 1);
+  REQUIRE(output["native_result"]["external_read_bytes"] == 64);
+  REQUIRE(output["native_result"]["prefetch_read_bytes"] == 0);
+  REQUIRE(output["native_result"]["token_cycles"].get<uint64_t>() > 0);
+  REQUIRE(output["native_result"]["simulator_commit"].get<std::string>().size() >= 12);
 }
 
 TEST_CASE("The replay driver rejects malformed integer strings")
