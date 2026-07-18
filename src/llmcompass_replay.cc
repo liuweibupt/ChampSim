@@ -99,6 +99,11 @@ struct ReplayReport {
   std::map<std::string, AddressSummary> phases{};
 };
 
+struct ReplayReportOptions {
+  bool keep_access_observations{true};
+  bool keep_address_summary{true};
+};
+
 struct NativePolicyInput {
   std::string config_path;
   std::string trace_path;
@@ -380,6 +385,121 @@ private:
   return json::parse(stream);
 }
 
+template <typename EntryHandler>
+class BridgeTraceSax final : public json::json_sax_t
+{
+public:
+  explicit BridgeTraceSax(EntryHandler& handler) : handler_(handler) {}
+
+  bool null() override { return reject("null bridge values are unsupported"); }
+  bool boolean(bool value) override { return set_value(value); }
+  bool number_integer(number_integer_t value) override { return set_value(value); }
+  bool number_unsigned(number_unsigned_t value) override { return set_value(value); }
+  bool number_float(number_float_t value, const string_t&) override { return set_value(value); }
+  bool string(string_t& value) override { return set_value(value); }
+  bool binary(binary_t&) override { return reject("binary bridge values are unsupported"); }
+
+  bool start_object(std::size_t) override
+  {
+    if (!array_open_ || object_open_ || array_closed_) {
+      return reject("bridge trace must be a top-level array of flat objects");
+    }
+    object_open_ = true;
+    current_entry_ = json::object();
+    return true;
+  }
+
+  bool key(string_t& value) override
+  {
+    if (!object_open_) {
+      return reject("bridge trace keys are only valid inside objects");
+    }
+    current_key_ = value;
+    return true;
+  }
+
+  bool end_object() override
+  {
+    if (!object_open_ || current_key_.has_value()) {
+      return reject("bridge trace object ended before a scalar value was recorded");
+    }
+    handler_(current_entry_);
+    ++rows_;
+    current_entry_ = json{};
+    object_open_ = false;
+    return true;
+  }
+
+  bool start_array(std::size_t) override
+  {
+    if (array_open_) {
+      return reject("nested bridge trace arrays are unsupported");
+    }
+    array_open_ = true;
+    return true;
+  }
+
+  bool end_array() override
+  {
+    if (!array_open_ || object_open_) {
+      return reject("bridge trace array ended while an object was still open");
+    }
+    array_closed_ = true;
+    return true;
+  }
+
+  bool parse_error(std::size_t, const std::string&, const json::exception& ex) override
+  {
+    error_ = ex.what();
+    return false;
+  }
+
+  [[nodiscard]] auto rows() const -> std::size_t { return rows_; }
+  [[nodiscard]] auto valid() const -> bool { return array_open_ && array_closed_ && rows_ > 0 && error_.empty(); }
+  [[nodiscard]] auto error() const -> const std::string& { return error_; }
+
+private:
+  template <typename Value>
+  bool set_value(Value value)
+  {
+    if (!object_open_ || !current_key_.has_value()) {
+      return reject("bridge trace scalar value is not attached to an object key");
+    }
+    current_entry_[*current_key_] = value;
+    current_key_.reset();
+    return true;
+  }
+
+  bool reject(std::string message)
+  {
+    error_ = std::move(message);
+    return false;
+  }
+
+  EntryHandler& handler_;
+  json current_entry_{};
+  std::optional<std::string> current_key_{};
+  bool array_open_{false};
+  bool array_closed_{false};
+  bool object_open_{false};
+  std::size_t rows_{0};
+  std::string error_{};
+};
+
+template <typename EntryHandler>
+void for_each_bridge_entry(const std::string& trace_path, EntryHandler handler)
+{
+  std::ifstream stream{trace_path};
+  if (!stream.is_open()) {
+    throw std::runtime_error{fmt::format("Unable to open bridge replay trace '{}'", trace_path)};
+  }
+  BridgeTraceSax<EntryHandler> sax{handler};
+  if (!json::sax_parse(stream, &sax) || !sax.valid()) {
+    const auto detail = sax.error().empty() ? "invalid or empty bridge trace" : sax.error();
+    throw std::invalid_argument{fmt::format("Unable to stream bridge replay trace '{}': {}", trace_path, detail)};
+  }
+}
+
 template <typename Builder>
 void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::channel* upper_level, champsim::channel* lower_level)
 {
@@ -553,7 +673,8 @@ void validate_policy_input(const NativePolicyInput& input, const json& config)
   return *it;
 }
 
-void append_bridge_lines(std::vector<ReplayAccess>& accesses, const json& entry, uint64_t line_size)
+template <typename AccessHandler>
+void append_bridge_lines(AccessHandler emit_access, const json& entry, uint64_t line_size)
 {
   const auto address = parse_u64(require_bridge_field(entry, "address"));
   const auto size = parse_u64(require_bridge_field(entry, "size"));
@@ -572,29 +693,25 @@ void append_bridge_lines(std::vector<ReplayAccess>& accesses, const json& entry,
   const auto type = parse_bridge_access_type(require_bridge_field(entry, "access_type"));
 
   for (uint64_t line_address = first_line;; line_address += line_size) {
-    accesses.push_back(ReplayAccess{champsim::address{line_address}, type, cpu, phase});
+    emit_access(ReplayAccess{champsim::address{line_address}, type, cpu, phase});
     if (line_address == last_line)
       break;
   }
 }
 
-[[nodiscard]] auto parse_bridge_accesses(const json& trace, uint64_t line_size) -> std::vector<ReplayAccess>
+template <typename AccessHandler>
+void stream_bridge_accesses(const std::string& trace_path, uint64_t line_size, AccessHandler emit_access)
 {
   if (line_size == 0) {
     throw std::invalid_argument{"Bridge replay line size must be positive"};
   }
-  if (!trace.is_array() || trace.empty()) {
-    throw std::invalid_argument{"Bridge replay trace must be a non-empty JSON array"};
-  }
-
-  std::vector<ReplayAccess> accesses{};
-  for (const auto& entry : trace) {
+  auto handle_entry = [&](const json& entry) {
     if (!entry.is_object()) {
       throw std::invalid_argument{"Bridge replay trace entries must be JSON objects"};
     }
-    append_bridge_lines(accesses, entry, line_size);
-  }
-  return accesses;
+    append_bridge_lines(emit_access, entry, line_size);
+  };
+  for_each_bridge_entry(trace_path, handle_entry);
 }
 
 [[nodiscard]] auto bridge_cache_config(const json& cache_json, const std::string& cache_name, uint64_t l3_size_byte, uint64_t associativity, uint64_t line_size) -> ReplayConfig
@@ -678,8 +795,22 @@ void record_phase_observation(std::map<std::string, AddressSummary>& phase_summa
   throw std::runtime_error{fmt::format("Replay access {} did not update cache hit/miss counters", format_address(access.address))};
 }
 
-template <typename Builder>
-[[nodiscard]] auto run_replay_with_builder(Builder builder, const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+void record_observation(ReplayReport& report, ReplayObservation observation, const ReplayReportOptions& options)
+{
+  report.total_latency_cycles += observation.latency_cycles;
+  report.hits += (observation.result == "hit");
+  report.misses += (observation.result == "miss");
+  if (options.keep_address_summary) {
+    record_address_observation(report.addresses, observation);
+  }
+  record_phase_observation(report.phases, observation);
+  if (options.keep_access_observations) {
+    report.accesses.push_back(std::move(observation));
+  }
+}
+
+template <typename Builder, typename Source>
+[[nodiscard]] auto run_replay_with_builder_source(Builder builder, const ReplayConfig& config, const ReplayReportOptions& options, Source source) -> ReplayReport
 {
   ReplayProducer producer{};
   FixedLatencyMemory memory{config.memory_latency};
@@ -695,49 +826,70 @@ template <typename Builder>
   }
 
   ReplayReport report{};
-  report.accesses.reserve(accesses.size());
-
-  for (const auto& access : accesses) {
-    auto observation = observe_access(cache, producer, memory, access);
-    report.total_latency_cycles += observation.latency_cycles;
-    report.hits += (observation.result == "hit");
-    report.misses += (observation.result == "miss");
-    record_address_observation(report.addresses, observation);
-    record_phase_observation(report.phases, observation);
-    report.accesses.push_back(std::move(observation));
-  }
+  auto observe_and_record = [&](const ReplayAccess& access) {
+    record_observation(report, observe_access(cache, producer, memory, access), options);
+  };
+  source(observe_and_record);
 
   return report;
 }
 
-[[nodiscard]] auto run_replay(const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+template <typename Builder>
+[[nodiscard]] auto run_replay_with_builder(Builder builder, const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+{
+  ReplayReportOptions options{};
+  auto source = [&](auto observe) {
+    for (const auto& access : accesses) {
+      observe(access);
+    }
+  };
+  auto report = run_replay_with_builder_source(builder, config, options, source);
+  return report;
+}
+
+template <typename Source>
+[[nodiscard]] auto run_bypass_replay_source(const ReplayConfig& config, const ReplayReportOptions& options, Source source) -> ReplayReport
+{
+  ReplayReport report{};
+  auto observe = [&](const ReplayAccess& access) {
+    record_observation(report,
+                       ReplayObservation{format_address(access.address),
+                                         "miss",
+                                         std::string{access_type_names.at(champsim::to_underlying(access.type))},
+                                         access.cpu,
+                                         config.memory_latency,
+                                         access.phase},
+                       options);
+  };
+  source(observe);
+  return report;
+}
+
+template <typename Source>
+[[nodiscard]] auto run_replay_source(const ReplayConfig& config, const ReplayReportOptions& options, Source source) -> ReplayReport
 {
   if (config.replacement_policy == ReplayConfig::replacement_policy_kind::bypass) {
-    ReplayReport report{};
-    report.accesses.reserve(accesses.size());
-    for (const auto& access : accesses) {
-      auto observation = ReplayObservation{format_address(access.address),
-                                           "miss",
-                                           std::string{access_type_names.at(champsim::to_underlying(access.type))},
-                                           access.cpu,
-                                           config.memory_latency,
-                                           access.phase};
-      ++report.misses;
-      report.total_latency_cycles += observation.latency_cycles;
-      record_address_observation(report.addresses, observation);
-      record_phase_observation(report.phases, observation);
-      report.accesses.push_back(std::move(observation));
-    }
-    return report;
+    return run_bypass_replay_source(config, options, source);
   }
 
   if (config.replacement_policy == ReplayConfig::replacement_policy_kind::srrip) {
     auto builder = champsim::cache_builder{champsim::defaults::default_llc}.replacement<srrip>();
-    return run_replay_with_builder(builder, config, accesses);
+    return run_replay_with_builder_source(builder, config, options, source);
   }
 
   auto builder = champsim::defaults::default_llc;
-  return run_replay_with_builder(builder, config, accesses);
+  return run_replay_with_builder_source(builder, config, options, source);
+}
+
+[[nodiscard]] auto run_replay(const ReplayConfig& config, const std::vector<ReplayAccess>& accesses) -> ReplayReport
+{
+  ReplayReportOptions options{};
+  auto source = [&](auto observe) {
+    for (const auto& access : accesses) {
+      observe(access);
+    }
+  };
+  return run_replay_source(config, options, source);
 }
 
 [[nodiscard]] auto to_json(const ReplayReport& report) -> json
@@ -836,9 +988,9 @@ void write_report(const json& report, const std::string& output_path)
                                      uint64_t l3_size_byte, uint64_t l3_associativity, uint64_t l3_line_size_byte) -> ReplayReport
 {
   const auto config = bridge_cache_config(cache_json, cache_name, l3_size_byte, l3_associativity, l3_line_size_byte);
-  const auto trace = read_json_file(trace_path);
-  const auto accesses = parse_bridge_accesses(trace, l3_line_size_byte);
-  return run_replay(config, accesses);
+  ReplayReportOptions options{false, false};
+  auto source = [&](auto observe) { stream_bridge_accesses(trace_path, l3_line_size_byte, observe); };
+  return run_replay_source(config, options, source);
 }
 
 [[nodiscard]] auto run_bridge_input(const std::string& trace_path, const std::string& cache_name, const std::string& bridge_cache_json,
