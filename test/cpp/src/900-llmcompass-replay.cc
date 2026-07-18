@@ -134,6 +134,7 @@ DriverResult run_policy_driver(const nlohmann::json& trace, const nlohmann::json
                  + " --l3-line-size-byte 64"
                  + " --sram_mib 1"
                  + " --policy " + policy
+                 + " --replay-scheduler event_driven"
                  + " --output '" + output_path + "'"
                  + " > '" + stdout_path + "' 2> '" + stderr_path + "'";
 
@@ -274,8 +275,10 @@ TEST_CASE("The bridge replay driver supports explicit bypass no-allocate policy"
 TEST_CASE("The policy replay driver emits native_result counters for G3 production commands")
 {
   const auto trace = nlohmann::json::array({
-      nlohmann::json{{"phase", "token_0/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
-      nlohmann::json{{"phase", "token_1/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"}},
+      nlohmann::json{{"phase", "token_0/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"},
+                     {"token_id", 0}, {"layer_id", 0}, {"residency_policy_hint", "managed_pinned"}, {"pin_window_id", "pinned_layers_0_0"}},
+      nlohmann::json{{"phase", "token_1/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"},
+                     {"token_id", 1}, {"layer_id", 0}, {"residency_policy_hint", "managed_pinned"}, {"pin_window_id", "pinned_layers_0_0"}},
   });
   const auto config = nlohmann::json{{"policy", "managed_pinned"},
                                      {"policy_implementation", "descriptor_managed_pin_window"},
@@ -297,6 +300,54 @@ TEST_CASE("The policy replay driver emits native_result counters for G3 producti
   REQUIRE(output["native_result"]["prefetch_read_bytes"] == 0);
   REQUIRE(output["native_result"]["token_cycles"].get<uint64_t>() > 0);
   REQUIRE(output["native_result"]["simulator_commit"].get<std::string>().size() >= 12);
+}
+
+TEST_CASE("The policy replay driver keeps prefetch hits separate from residency savings")
+{
+  const auto trace = nlohmann::json::array({
+      nlohmann::json{{"phase", "token_0/layer_1/q/prefetch"}, {"address", 64}, {"size", 64}, {"access_type", "prefetch"},
+                     {"token_id", 0}, {"layer_id", 1}, {"residency_policy_hint", "next_layer_prefetch"}, {"pin_window_id", "NA"}},
+      nlohmann::json{{"phase", "token_0/layer_1/q/demand"}, {"address", 64}, {"size", 64}, {"access_type", "read"},
+                     {"token_id", 0}, {"layer_id", 1}, {"residency_policy_hint", "next_layer_prefetch"}, {"pin_window_id", "NA"}},
+  });
+  const auto config = nlohmann::json{{"policy", "next_layer_prefetch"},
+                                     {"policy_implementation", "lookahead_prefetch_no_persistence"},
+                                     {"capacity", {{"sram_mib", 1}, {"capacity_bytes", 256}, {"line_bytes", 64}, {"associativity", 2}}},
+                                     {"timing", {{"hit_latency_cycles", 2}, {"fill_latency_cycles", 1}, {"hbm_fallback_latency_cycles", 5}}}};
+
+  const auto result = run_policy_driver(trace, config, "next_layer_prefetch");
+
+  REQUIRE(result.exit_code == 0);
+  const auto output = nlohmann::json::parse(result.output_text);
+  REQUIRE(output["native_result"]["demand_accesses"] == 1);
+  REQUIRE(output["native_result"]["demand_hits"] == 1);
+  REQUIRE(output["native_result"]["residency_saved_hits"] == 0);
+  REQUIRE(output["native_result"]["external_read_bytes"] == 0);
+  REQUIRE(output["native_result"]["prefetch_read_bytes"] == 64);
+}
+
+TEST_CASE("The policy replay driver preserves bypass no-allocate native counters")
+{
+  const auto trace = nlohmann::json::array({
+      nlohmann::json{{"phase", "token_0/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"},
+                     {"token_id", 0}, {"layer_id", 0}, {"residency_policy_hint", "bypass"}, {"pin_window_id", "NA"}},
+      nlohmann::json{{"phase", "token_1/layer_0/q/demand"}, {"address", 0}, {"size", 64}, {"access_type", "read"},
+                     {"token_id", 1}, {"layer_id", 0}, {"residency_policy_hint", "bypass"}, {"pin_window_id", "NA"}},
+  });
+  const auto config = nlohmann::json{{"policy", "bypass"},
+                                     {"policy_implementation", "streaming_no_allocate_bypass"},
+                                     {"capacity", {{"sram_mib", 1}, {"capacity_bytes", 256}, {"line_bytes", 64}, {"associativity", 2}}},
+                                     {"timing", {{"hit_latency_cycles", 2}, {"fill_latency_cycles", 1}, {"hbm_fallback_latency_cycles", 5}}}};
+
+  const auto result = run_policy_driver(trace, config, "bypass");
+
+  REQUIRE(result.exit_code == 0);
+  const auto output = nlohmann::json::parse(result.output_text);
+  REQUIRE(output["native_result"]["demand_accesses"] == 2);
+  REQUIRE(output["native_result"]["demand_hits"] == 0);
+  REQUIRE(output["native_result"]["residency_saved_hits"] == 0);
+  REQUIRE(output["native_result"]["external_read_bytes"] == 128);
+  REQUIRE(output["native_result"]["sram_write_bytes"] == 0);
 }
 
 TEST_CASE("The replay driver rejects malformed integer strings")

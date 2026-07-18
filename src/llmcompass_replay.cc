@@ -39,6 +39,7 @@
 #include "cache.h"
 #include "channel.h"
 #include "defaults.hpp"
+#include "llmcompass_policy_event_replay.h"
 #include "operable.h"
 #include "../replacement/srrip/srrip.h"
 #include "util/to_underlying.h"
@@ -60,10 +61,14 @@ struct ReplayAccess {
   access_type type{access_type::LOAD};
   uint32_t cpu{0};
   std::string phase{"default"};
+  uint64_t token_id{0};
+  uint64_t layer_id{0};
+  std::string residency_policy_hint{};
+  std::string pin_window_id{"NA"};
 };
 
 struct ReplayConfig {
-  enum class replacement_policy_kind { lru, srrip, bypass };
+  enum class replacement_policy_kind { lru, srrip, bypass, managed_pinned };
 
   std::optional<std::string> name;
   std::optional<uint32_t> sets;
@@ -75,6 +80,8 @@ struct ReplayConfig {
   uint64_t memory_latency{1};
   replacement_policy_kind replacement_policy{replacement_policy_kind::lru};
 };
+
+enum class ReplayScheduler { cycle, event_driven };
 
 struct ReplayObservation {
   std::string address;
@@ -113,6 +120,7 @@ struct NativePolicyInput {
   uint64_t l3_line_size_byte{0};
   uint64_t sram_mib{0};
   std::string policy;
+  ReplayScheduler scheduler{ReplayScheduler::cycle};
 };
 
 constexpr uint64_t NATIVE_POLICY_CLOCK_HZ = 1000000000;
@@ -530,7 +538,19 @@ void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::chan
     return ReplayConfig::replacement_policy_kind::srrip;
   if (normalized == "BYPASS" || normalized == "NO_ALLOCATE" || normalized == "STREAMING_NO_ALLOCATE_BYPASS")
     return ReplayConfig::replacement_policy_kind::bypass;
+  if (normalized == "MANAGED_PINNED" || normalized == "DESCRIPTOR_MANAGED_PIN_WINDOW")
+    return ReplayConfig::replacement_policy_kind::managed_pinned;
   throw std::invalid_argument{fmt::format("Unsupported replay replacement policy '{}'", value)};
+}
+
+[[nodiscard]] auto parse_replay_scheduler(std::string_view value) -> ReplayScheduler
+{
+  const auto normalized = upper_case(std::string{value});
+  if (normalized == "CYCLE" || normalized == "PER_CYCLE")
+    return ReplayScheduler::cycle;
+  if (normalized == "EVENT_DRIVEN")
+    return ReplayScheduler::event_driven;
+  throw std::invalid_argument{fmt::format("Unsupported replay scheduler '{}'", value)};
 }
 
 [[nodiscard]] auto parse_config(const json& document) -> ReplayConfig
@@ -581,9 +601,11 @@ void apply_cache_overrides(Builder& builder, ReplayConfig config, champsim::chan
 [[nodiscard]] auto replacement_policy_for_implementation(std::string_view implementation) -> std::string
 {
   const auto normalized = upper_case(std::string{implementation});
-  if (normalized == "TRANSPARENT_LRU_ALLOCATE_ON_MISS" || normalized == "DESCRIPTOR_MANAGED_PIN_WINDOW" ||
-      normalized == "LOOKAHEAD_PREFETCH_NO_PERSISTENCE") {
+  if (normalized == "TRANSPARENT_LRU_ALLOCATE_ON_MISS" || normalized == "LOOKAHEAD_PREFETCH_NO_PERSISTENCE") {
     return "lru";
+  }
+  if (normalized == "DESCRIPTOR_MANAGED_PIN_WINDOW") {
+    return "managed_pinned";
   }
   if (normalized == "STREAMING_NO_ALLOCATE_BYPASS") {
     return "bypass";
@@ -673,6 +695,18 @@ void validate_policy_input(const NativePolicyInput& input, const json& config)
   return *it;
 }
 
+void validate_bridge_phase_metadata(const ReplayAccess& access)
+{
+  const auto phase_marks_prefetch = ends_with(access.phase, PREFETCH_PHASE_SUFFIX);
+  const auto phase_marks_demand = ends_with(access.phase, DEMAND_PHASE_SUFFIX);
+  if (phase_marks_prefetch && access.type != access_type::PREFETCH) {
+    throw std::invalid_argument{"Bridge replay phase suffix /prefetch requires access_type PREFETCH"};
+  }
+  if (phase_marks_demand && access.type == access_type::PREFETCH) {
+    throw std::invalid_argument{"Bridge replay phase suffix /demand is inconsistent with access_type PREFETCH"};
+  }
+}
+
 template <typename AccessHandler>
 void append_bridge_lines(AccessHandler emit_access, const json& entry, uint64_t line_size)
 {
@@ -691,9 +725,15 @@ void append_bridge_lines(AccessHandler emit_access, const json& entry, uint64_t 
   const auto phase = entry.value("phase", "default");
   const auto cpu = entry.contains("cpu") ? parse_u32(entry["cpu"], "cpu") : uint32_t{0};
   const auto type = parse_bridge_access_type(require_bridge_field(entry, "access_type"));
+  const auto token_id = entry.contains("token_id") ? parse_u64(entry["token_id"]) : uint64_t{0};
+  const auto layer_id = entry.contains("layer_id") ? parse_u64(entry["layer_id"]) : uint64_t{0};
+  const auto residency_policy_hint = entry.value("residency_policy_hint", "");
+  const auto pin_window_id = entry.value("pin_window_id", "NA");
 
   for (uint64_t line_address = first_line;; line_address += line_size) {
-    emit_access(ReplayAccess{champsim::address{line_address}, type, cpu, phase});
+    const ReplayAccess access{champsim::address{line_address}, type, cpu, phase, token_id, layer_id, residency_policy_hint, pin_window_id};
+    validate_bridge_phase_metadata(access);
+    emit_access(access);
     if (line_address == last_line)
       break;
   }
@@ -877,6 +917,10 @@ template <typename Source>
     return run_replay_with_builder_source(builder, config, options, source);
   }
 
+  if (config.replacement_policy == ReplayConfig::replacement_policy_kind::managed_pinned) {
+    throw std::invalid_argument{"managed_pinned requires the native policy event-driven replay path"};
+  }
+
   auto builder = champsim::defaults::default_llc;
   return run_replay_with_builder_source(builder, config, options, source);
 }
@@ -1036,6 +1080,85 @@ void write_report(const json& report, const std::string& output_path)
   throw std::runtime_error{"Unable to resolve ChampSim git commit for native_result"};
 }
 
+template <typename T>
+[[nodiscard]] auto required_latency(const std::optional<T>& value, std::string_view name) -> uint64_t
+{
+  if (!value.has_value()) {
+    throw std::invalid_argument{fmt::format("Event-driven policy replay requires {} in the 3D-SRAM config", name)};
+  }
+  return static_cast<uint64_t>(*value);
+}
+
+[[nodiscard]] auto event_timing_from_config(const ReplayConfig& config, uint64_t line_size) -> llmcompass::policy_event_timing
+{
+  return llmcompass::policy_event_timing{line_size,
+                                         required_latency(config.sets, "sets"),
+                                         required_latency(config.ways, "ways"),
+                                         required_latency(config.hit_latency, "hit_latency_cycles"),
+                                         required_latency(config.fill_latency, "fill_latency_cycles"),
+                                         config.memory_latency};
+}
+
+[[nodiscard]] auto event_access_from_replay(const ReplayAccess& access) -> llmcompass::policy_event_access
+{
+  return llmcompass::policy_event_access{access.address.to<uint64_t>(),
+                                         access.type == access_type::PREFETCH,
+                                         access.token_id,
+                                         access.layer_id,
+                                         access.residency_policy_hint,
+                                         access.pin_window_id};
+}
+
+[[nodiscard]] auto measured_tokens(const json& trace_config) -> uint64_t
+{
+  const auto total_tokens = parse_u64(trace_config.at("tokens"));
+  const auto warmup_tokens = parse_u64(trace_config.at("warmup_tokens"));
+  if (warmup_tokens >= total_tokens) {
+    throw std::invalid_argument{"trace_config warmup_tokens must be smaller than tokens for measured native_result output"};
+  }
+  return total_tokens - warmup_tokens;
+}
+
+[[nodiscard]] auto run_policy_event_report(const NativePolicyInput& input, const json& config, const json& trace_config)
+    -> llmcompass::policy_event_counters
+{
+  const auto replay_config = bridge_cache_config(cache_json_from_3dsram_config(config), input.cache_name, input.l3_size_byte, input.l3_associativity,
+                                                input.l3_line_size_byte);
+  const auto timing = event_timing_from_config(replay_config, input.l3_line_size_byte);
+  const auto policy = llmcompass::policy_from_string(input.policy);
+  const auto warmup_tokens = parse_u64(trace_config.at("warmup_tokens"));
+  auto source = [&](auto emit) {
+    stream_bridge_accesses(input.trace_path, input.l3_line_size_byte,
+                           [&](const ReplayAccess& access) { emit(event_access_from_replay(access)); });
+  };
+  return llmcompass::run_policy_event_replay(policy, timing, warmup_tokens, source);
+}
+
+[[nodiscard]] auto native_result_json(const llmcompass::policy_event_counters& counters, const json& trace_config) -> json
+{
+  if (counters.total_latency_cycles == 0) {
+    throw std::runtime_error{"3D-SRAM event-driven policy replay produced zero measured token cycles"};
+  }
+  const auto tokens = measured_tokens(trace_config);
+  const auto seconds = static_cast<double>(counters.total_latency_cycles) / static_cast<double>(NATIVE_POLICY_CLOCK_HZ);
+  const auto stats = json{{"demand_accesses", counters.demand_accesses},
+                          {"demand_hits", counters.demand_hits},
+                          {"residency_saved_hits", counters.residency_saved_hits},
+                          {"external_read_bytes", counters.external_read_bytes},
+                          {"prefetch_read_bytes", counters.prefetch_read_bytes},
+                          {"sram_read_bytes", counters.sram_read_bytes},
+                          {"sram_write_bytes", counters.sram_write_bytes},
+                          {"bank_conflict_cycles", 0},
+                          {"controller_stall_cycles", 0},
+                          {"token_cycles", counters.total_latency_cycles},
+                          {"token_ms", fmt::format("{:.6f}", seconds * 1000.0)},
+                          {"tok_s", fmt::format("{:.6f}", static_cast<double>(tokens) / seconds)},
+                          {"simulator_commit", simulator_commit()},
+                          {"status", "ok"},
+                          {"notes", fmt::format("{}; replay_scheduler=event_driven_pin_aware", NATIVE_POLICY_NOTE)}};
+  return json{{"native_result", stats}};
+}
+
 [[nodiscard]] auto native_result_json(const NativePolicyInput& input, const ReplayReport& report, const json& bridge_config, const json& trace_config) -> json
 {
   const auto demand_hits = phase_count(report, DEMAND_PHASE_SUFFIX, true);
@@ -1044,7 +1167,7 @@ void write_report(const json& report, const std::string& output_path)
   if (report.total_latency_cycles == 0) {
     throw std::runtime_error{"3D-SRAM policy replay produced zero token cycles"};
   }
-  const auto measured_tokens = parse_u64(trace_config.at("tokens"));
+  const auto measured_token_count = measured_tokens(trace_config);
   const auto seconds = static_cast<double>(report.total_latency_cycles) / static_cast<double>(NATIVE_POLICY_CLOCK_HZ);
   const auto line_bytes = input.l3_line_size_byte;
   const auto stats = json{{"demand_accesses", parse_u64(bridge_config.at("demand_rows"))},
@@ -1058,10 +1181,10 @@ void write_report(const json& report, const std::string& output_path)
                           {"controller_stall_cycles", 0},
                           {"token_cycles", report.total_latency_cycles},
                           {"token_ms", fmt::format("{:.6f}", seconds * 1000.0)},
-                          {"tok_s", fmt::format("{:.6f}", static_cast<double>(measured_tokens) / seconds)},
+                          {"tok_s", fmt::format("{:.6f}", static_cast<double>(measured_token_count) / seconds)},
                           {"simulator_commit", simulator_commit()},
                           {"status", "ok"},
-                          {"notes", std::string{NATIVE_POLICY_NOTE}}};
+                          {"notes", fmt::format("{}; replay_scheduler=cycle", NATIVE_POLICY_NOTE)}};
   return json{{"native_result", stats}};
 }
 
@@ -1071,6 +1194,9 @@ void write_report(const json& report, const std::string& output_path)
   validate_policy_input(input, config);
   const auto bridge_config = read_json_file(sibling_path(input.trace_path, "bridge_trace_config.json"));
   const auto trace_config = read_json_file(sibling_path(input.trace_path, "trace_config.json"));
+  if (input.scheduler == ReplayScheduler::event_driven) {
+    return native_result_json(run_policy_event_report(input, config, trace_config), trace_config);
+  }
   const auto report = run_bridge_report(input.trace_path, input.cache_name, cache_json_from_3dsram_config(config),
                                         input.l3_size_byte, input.l3_associativity, input.l3_line_size_byte);
   return native_result_json(input, report, bridge_config, trace_config);
@@ -1089,6 +1215,7 @@ int llmcompass_replay_main(int argc, char** argv)
   std::string output_format{"json"};
   std::string bridge_cache_json;
   std::string policy;
+  std::string replay_scheduler{"event_driven"};
   uint64_t l3_size_byte{0};
   uint64_t l3_associativity{0};
   uint64_t l3_line_size_byte{0};
@@ -1109,6 +1236,7 @@ int llmcompass_replay_main(int argc, char** argv)
   app.add_option("--output-format", output_format, "LLMCompass bridge output format");
   app.add_option("--bridge-cache-json", bridge_cache_json, "Optional LLMCompass bridge cache timing JSON");
   app.add_option("--bridge-clock-frequency-hz", bridge_clock_frequency_hz, "Clock frequency used to convert replay cycles to seconds");
+  app.add_option("--replay-scheduler", replay_scheduler, "3D-SRAM policy replay scheduler: event_driven or cycle");
 
   try {
     app.parse(argc, argv);
@@ -1126,7 +1254,15 @@ int llmcompass_replay_main(int argc, char** argv)
           throw std::invalid_argument{"3D-SRAM policy mode requires --config, --policy, and positive --sram_mib"};
         }
         write_report(
-            run_policy_input(NativePolicyInput{config_path, trace_path, cache_name, l3_size_byte, l3_associativity, l3_line_size_byte, sram_mib, policy}),
+            run_policy_input(NativePolicyInput{config_path,
+                                               trace_path,
+                                               cache_name,
+                                               l3_size_byte,
+                                               l3_associativity,
+                                               l3_line_size_byte,
+                                               sram_mib,
+                                               policy,
+                                               parse_replay_scheduler(replay_scheduler)}),
             output_path);
         return 0;
       }
